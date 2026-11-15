@@ -39,18 +39,29 @@ jobs:
           haxelib newrepo
           haxelib install hxcpp --quiet
           haxelib install openfl 9.2.2 --quiet
-          haxelib install hxvlc 1.9.3 --quiet
-          pin() {
+          haxelib install lime 8.1.2 --quiet
+          haxelib install hxvlc 1.9.3 --skip-dependencies --quiet
+          haxelib install format --quiet
+          haxelib install markdown --quiet
+          haxelib install nape-haxe4 --quiet
+          pin() { # nama url [branch]
             rm -rf "/tmp/$1"
-            git clone --quiet "$2" "/tmp/$1"
+            if [ -n "$3" ]; then
+              git clone --quiet -b "$3" "$2" "/tmp/$1"
+            else
+              git clone --quiet "$2" "/tmp/$1"
+            fi
             SHA=$(git -C "/tmp/$1" rev-list -n 1 --before="$PIN_DATE" HEAD)
             echo "PIN $1 -> $SHA"
+            echo "LIBSXML <git name=\"$1\" url=\"$2\" ref=\"$SHA\" />"
             haxelib git "$1" "$2" "$SHA"
           }
-          pin lime https://github.com/MaysLastPlays-Stuff/lime-h
           pin flixel https://github.com/CodenameCrew/cne-flixel
           pin flixel-addons https://github.com/CodenameCrew/cne-flixel-addons
-          pin hscript-improved https://github.com/CodenameCrew/hscript-improved
+          pin hscript-improved https://github.com/CodenameCrew/hscript-improved custom-classes
+          pin flxanimate https://github.com/CodenameCrew/cne-flxanimate
+          pin hxdiscord_rpc https://github.com/CodenameCrew/cne-hxdiscord_rpc
+          pin away3d https://github.com/CodenameCrew/away3d
           pin extension-androidtools https://github.com/MAJigsaw77/extension-androidtools
           haxelib list
           haxelib run lime rebuild hxcpp
