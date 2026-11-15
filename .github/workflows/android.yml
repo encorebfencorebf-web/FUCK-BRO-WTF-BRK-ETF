@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       pin_date:
-        description: "Tanggal pin library (YYYY-MM-DD)"
+        description: "Tanggal awal pencarian (YYYY-MM-DD)"
         required: true
         default: "2025-11-17"
 jobs:
@@ -11,6 +11,7 @@ jobs:
     name: Android Build
     permissions: write-all
     runs-on: ubuntu-22.04
+    timeout-minutes: 355
     steps:
       - name: Pulling the new commit
         uses: actions/checkout@v2
@@ -23,18 +24,7 @@ jobs:
         uses: nttld/setup-ndk@main
         with:
           ndk-version: r25c
-      - name: Restore Previous Cache
-        id: cache-debug-build-android-restore
-        uses: actions/cache/restore@main
-        with:
-          path: |
-            .haxelib/
-            export/release/android/haxe/
-            export/release/android/obj/
-          key: cache-android-pinned-${{ inputs.pin_date }}
-      - name: Installing libraries (pinned by date)
-        env:
-          PIN_DATE: ${{ inputs.pin_date }}
+      - name: Installing base libraries
         run: |
           haxelib newrepo
           haxelib install hxcpp --quiet
@@ -44,27 +34,6 @@ jobs:
           haxelib install format --quiet
           haxelib install markdown --quiet
           haxelib install nape-haxe4 --quiet
-          haxelib install flixel-ui 2.6.1 --skip-dependencies --quiet
-          pin() { # nama url [branch]
-            rm -rf "/tmp/$1"
-            if [ -n "$3" ]; then
-              git clone --quiet -b "$3" "$2" "/tmp/$1"
-            else
-              git clone --quiet "$2" "/tmp/$1"
-            fi
-            SHA=$(git -C "/tmp/$1" rev-list -n 1 --before="$PIN_DATE" HEAD)
-            echo "PIN $1 -> $SHA"
-            echo "LIBSXML <git name=\"$1\" url=\"$2\" ref=\"$SHA\" />"
-            haxelib git "$1" "$2" "$SHA"
-          }
-          pin flixel https://github.com/CodenameCrew/cne-flixel
-          pin flixel-addons https://github.com/CodenameCrew/cne-flixel-addons
-          pin hscript-improved https://github.com/CodenameCrew/hscript-improved custom-classes
-          pin flxanimate https://github.com/CodenameCrew/cne-flxanimate
-          pin hxdiscord_rpc https://github.com/CodenameCrew/cne-hxdiscord_rpc
-          pin away3d https://github.com/CodenameCrew/away3d
-          pin extension-androidtools https://github.com/MAJigsaw77/extension-androidtools
-          haxelib list
           haxelib run lime rebuild hxcpp
       - name: Configure Android
         run: |
@@ -73,124 +42,221 @@ jobs:
           haxelib run lime config ANDROID_NDK_ROOT $ANDROID_NDK_HOME
           haxelib run lime config JAVA_HOME $JAVA_HOME_17_X64
           haxelib run lime config ANDROID_SETUP true
-      - name: Building the game (multi-attempt, auto-fix)
+      - name: Solver - search library versions and build
         env:
           PIN_DATE: ${{ inputs.pin_date }}
         run: |
           set +e
-          ADDONS_URL="https://github.com/CodenameCrew/cne-flixel-addons"
-          MAX_ATTEMPTS=8
-          SUMMARY="/tmp/attempts.txt"
+          START=$SECONDS
+          LIMIT=16200
+          MAX_ATTEMPTS=40
+          LOGDIR=/tmp/solver
+          mkdir -p "$LOGDIR" /tmp/c
+          SUMMARY="$LOGDIR/summary.txt"
           : > "$SUMMARY"
 
-          # ---------- 1. Kumpulkan kandidat flixel-addons ----------
-          CANDS=()
-          rm -rf /tmp/fa
-          git clone --quiet "$ADDONS_URL" /tmp/fa
-          for b in $(git -C /tmp/fa branch -r | grep -v HEAD | sed 's|^ *origin/||'); do
-            SHA=$(git -C /tmp/fa rev-list -n 1 --before="$PIN_DATE" "origin/$b" 2>/dev/null)
-            [ -z "$SHA" ] && continue
-            V=$(git -C /tmp/fa show "$SHA:haxelib.json" 2>/dev/null | grep -m1 '"version"' | sed -E 's/.*"version"[^"]*"([^"]+)".*/\1/')
-            [ -z "$V" ] && continue
-            echo "ADDONS branch $b @ $SHA version $V"
-            if [ "$(printf '%s\n%s\n' 3.3.0 "$V" | sort -V | head -n1)" = "3.3.0" ]; then
-              CANDS+=("git|$b|$SHA|$V")
-            fi
-          done
-          CANDS+=("hx|3.3.2" "hx|3.3.1" "hx|3.3.0")
-          echo "Total kandidat addons: ${#CANDS[@]}"
+          FLIXEL_URL="https://github.com/CodenameCrew/cne-flixel"
+          ADDONS_CNE="https://github.com/CodenameCrew/cne-flixel-addons"
+          ADDONS_UP="https://github.com/HaxeFlixel/flixel-addons"
+          UI_URL="https://github.com/HaxeFlixel/flixel-ui"
+          HSCRIPT_URL="https://github.com/CodenameCrew/hscript-improved"
+          ANIMATE_URL="https://github.com/CodenameCrew/cne-flxanimate"
+          DISCORD_URL="https://github.com/CodenameCrew/cne-hxdiscord_rpc"
+          AWAY_URL="https://github.com/CodenameCrew/away3d"
+          ANDROIDTOOLS_URL="https://github.com/MAJigsaw77/extension-androidtools"
 
-          # ---------- 2. Fungsi bantu ----------
-          set_addons() {
-            IFS='|' read -r kind a b c <<< "$1"
-            haxelib remove flixel-addons > /dev/null 2>&1
-            if [ "$kind" = "git" ]; then
-              haxelib git flixel-addons "$ADDONS_URL" "$b"
-            else
-              haxelib install flixel-addons "$a" --skip-dependencies --quiet
-            fi
+          declare -A LOCK
+
+          # ---------- fungsi bantu ----------
+          getver() { # nama sha
+            git -C "/tmp/c/$1" show "$2:haxelib.json" 2>/dev/null | grep -m1 '"version"' | sed -E 's/.*"version"[^"]*"([^"]+)".*/\1/'
           }
-
-          try_build() {
-            echo "=============================================="
-            echo "ATTEMPT $1 | addons=$2 | flixel-ui=$3"
-            echo "=============================================="
-            haxelib list | grep -E "flixel|addons|lime|openfl"
-            haxelib run lime build android -final 2>&1 | tee /tmp/build.log
-            if [ "${PIPESTATUS[0]}" -eq 0 ]; then
-              echo "ATTEMPT $1 (addons=$2, ui=$3): SUKSES" >> "$SUMMARY"
-              return 0
+          vge() { # $1 >= $2 ?
+            [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
+          }
+          clone() { # nama url
+            [ -d "/tmp/c/$1" ] || git clone --quiet "$2" "/tmp/c/$1"
+          }
+          branches() { # nama
+            git -C "/tmp/c/$1" branch -r | grep -v HEAD | sed 's|^ *origin/||'
+          }
+          sha_at() { # nama ref tanggal
+            git -C "/tmp/c/$1" rev-list -n 1 --before="$3" "$2" 2>/dev/null
+          }
+          install_git() { # lib url sha
+            haxelib remove "$1" > /dev/null 2>&1
+            haxelib git "$1" "$2" "$3" > /dev/null 2>&1
+            local rc=$?
+            if [ $rc -eq 0 ]; then
+              LOCK["$1"]="<git name=\"$1\" url=\"$2\" ref=\"$3\" />"
+              echo "  PIN $1 -> $3"
+            else
+              echo "  GAGAL pasang $1 @ $3"
             fi
-            ERR=$(grep -E "Error|error :|characters|Unsupported|Could not find|Type not found" /tmp/build.log | head -n 5)
-            echo "ATTEMPT $1 (addons=$2, ui=$3): GAGAL" >> "$SUMMARY"
-            echo "$ERR" >> "$SUMMARY"
-            echo "" >> "$SUMMARY"
+            return $rc
+          }
+          pin_static() { # nama lib url ref tanggal
+            local sha
+            sha=$(sha_at "$1" "$4" "$5")
+            [ -z "$sha" ] && sha=$(git -C "/tmp/c/$1" rev-parse "$4")
+            install_git "$2" "$3" "$sha"
+          }
+          best_addons() { # tanggal -> sha CNE dengan versi tertinggi
+            local b s v BV="0" OUT=""
+            for b in $(branches addons-cne); do
+              s=$(sha_at addons-cne "origin/$b" "$1")
+              [ -z "$s" ] && continue
+              v=$(getver addons-cne "$s")
+              [ -z "$v" ] && continue
+              if vge "$v" "$BV" && [ "$v" != "$BV" ]; then BV="$v"; OUT="$s"; fi
+            done
+            echo "$OUT"
+          }
+          fix_with() { # lib min nama url ref
+            local sha v
+            clone "$3" "$4"
+            sha=$(git -C "/tmp/c/$3" rev-parse "$5" 2>/dev/null)
+            [ -z "$sha" ] && return 1
+            v=$(getver "$3" "$sha")
+            [ -z "$v" ] && return 1
+            if vge "$v" "$2"; then
+              echo "  AUTOFIX kandidat $1 versi $v dari $4 ($5)"
+              install_git "$1" "$4" "$sha" && return 0
+            fi
             return 1
           }
+          autofix() { # logfile -> 0 kalau ada yang diubah
+            local line name min lib b
+            line=$(grep -m1 -E "Unsupported Flixel .* version! Supported versions are" "$1")
+            [ -z "$line" ] && return 1
+            name=$(echo "$line" | sed -E 's/.*Unsupported Flixel (.*) version!.*/\1/' | tr 'A-Z ' 'a-z-')
+            min=$(echo "$line" | sed -E 's/.*are ([0-9][0-9.]*) or newer.*/\1/')
+            lib="flixel-$name"
+            echo "  AUTOFIX: $lib butuh >= $min"
+            case "$lib" in
+              flixel-ui)
+                fix_with flixel-ui "$min" ui-up "$UI_URL" origin/HEAD && return 0
+                ;;
+              flixel-addons)
+                for b in $(branches addons-cne); do
+                  fix_with flixel-addons "$min" addons-cne "$ADDONS_CNE" "origin/$b" && return 0
+                done
+                fix_with flixel-addons "$min" addons-up "$ADDONS_UP" origin/HEAD && return 0
+                ;;
+            esac
+            return 1
+          }
+          run_build() { # label
+            timeout 80m haxelib run lime build android -final 2>&1 | tee "$LOGDIR/$1.log"
+            return "${PIPESTATUS[0]}"
+          }
+          late_stage() { # logfile
+            grep -qE "Compiling group|ndk-build|gradlew|> Task :|BUILD FAILED|FAILURE: Build failed" "$1"
+          }
+          errsum() { # logfile
+            grep -E "Error|characters [0-9]+-[0-9]+|Unsupported|Could not find|Type not found|Loop in class" "$1" | head -n 6
+          }
 
-          # ---------- 3. Coba semua kombinasi ----------
+          # ---------- siapkan clone ----------
+          clone flixel "$FLIXEL_URL"
+          clone addons-cne "$ADDONS_CNE"
+          clone ui "$UI_URL"
+          clone hscript "$HSCRIPT_URL"
+          clone animate "$ANIMATE_URL"
+          clone discord "$DISCORD_URL"
+          clone away "$AWAY_URL"
+          clone androidtools "$ANDROIDTOOLS_URL"
+
+          DEFAULT_REF=$(git -C /tmp/c/flixel symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)
+          FREFS=()
+          [ -n "$DEFAULT_REF" ] && FREFS+=("$DEFAULT_REF")
+          for b in $(branches flixel); do
+            [ "origin/$b" = "$DEFAULT_REF" ] && continue
+            FREFS+=("origin/$b")
+          done
+          echo "Branch flixel yang akan dicoba: ${FREFS[*]}"
+
+          DATES=("$PIN_DATE" 2025-10-15 2025-09-01 2025-07-01 2025-04-01 2025-01-01 2024-09-01 2024-06-01 2024-03-01 2024-01-01)
+
+          # ---------- pencarian ----------
           N=0
-          OK=0
-          for UI in 2.6.1 2.5.0; do
-            haxelib install flixel-ui "$UI" --skip-dependencies --quiet
-            for C in "${CANDS[@]}"; do
+          FOUND=0
+          STOP=0
+          for D in "${DATES[@]}"; do
+            for FR in "${FREFS[@]}"; do
+              [ "$N" -ge "$MAX_ATTEMPTS" ] && { echo "Batas percobaan tercapai"; break 2; }
+              [ $((SECONDS-START)) -gt "$LIMIT" ] && { echo "Batas waktu tercapai"; break 2; }
               N=$((N+1))
-              [ "$N" -gt "$MAX_ATTEMPTS" ] && break 2
-              set_addons "$C"
-              if [ $? -ne 0 ]; then
-                echo "ATTEMPT $N: kandidat $C tidak bisa dipasang, lewati" | tee -a "$SUMMARY"
-                continue
+              echo ""
+              echo "################ KOMBINASI $N | tanggal=$D | flixel=$FR ################"
+              LOCK=()
+              pin_static flixel flixel "$FLIXEL_URL" "$FR" "$D"
+              pin_static hscript hscript-improved "$HSCRIPT_URL" origin/custom-classes "$D"
+              pin_static animate flxanimate "$ANIMATE_URL" origin/HEAD "$D"
+              pin_static discord hxdiscord_rpc "$DISCORD_URL" origin/HEAD "$D"
+              pin_static away away3d "$AWAY_URL" origin/HEAD "$D"
+              pin_static androidtools extension-androidtools "$ANDROIDTOOLS_URL" origin/HEAD "$D"
+              ASHA=$(best_addons "$D")
+              if [ -n "$ASHA" ]; then
+                install_git flixel-addons "$ADDONS_CNE" "$ASHA"
+              else
+                pin_static addons-cne flixel-addons "$ADDONS_CNE" origin/HEAD "$D"
               fi
-              if try_build "$N" "$C" "$UI"; then
-                OK=1
-                break 2
-              fi
+              pin_static ui flixel-ui "$UI_URL" origin/HEAD "$D"
+
+              ROUND=0
+              FIXED=""
+              while [ "$ROUND" -lt 5 ]; do
+                ROUND=$((ROUND+1))
+                LABEL="k${N}_r${ROUND}"
+                echo "--- build $LABEL ---"
+                haxelib list | grep -E "flixel|hscript|lime|openfl"
+                run_build "$LABEL"
+                RC=$?
+                if [ "$RC" -eq 0 ]; then
+                  FOUND=1
+                  break 3
+                fi
+                {
+                  echo "KOMBINASI $N ronde $ROUND (tanggal=$D, flixel=$FR): GAGAL"
+                  errsum "$LOGDIR/$LABEL.log"
+                  echo ""
+                } >> "$SUMMARY"
+                if late_stage "$LOGDIR/$LABEL.log"; then
+                  echo "Tahap Haxe sudah lolos, error ada di tahap C++/Gradle. Pencarian berhenti."
+                  echo "TAHAP HAXE LOLOS pada kombinasi $N (tanggal=$D, flixel=$FR). Error berikutnya di tahap C++/Gradle." >> "$SUMMARY"
+                  STOP=1
+                  break 3
+                fi
+                KEY=$(grep -m1 -E "Unsupported Flixel .* version" "$LOGDIR/$LABEL.log")
+                if [ -n "$KEY" ] && [ "$KEY" = "$FIXED" ]; then
+                  echo "Error sama berulang setelah autofix, lanjut kombinasi berikutnya"
+                  break
+                fi
+                FIXED="$KEY"
+                autofix "$LOGDIR/$LABEL.log" || break
+              done
             done
           done
 
-          # ---------- 4. Ringkasan ----------
-          echo "================ RINGKASAN PERCOBAAN ================"
+          # ---------- ringkasan ----------
+          echo "================ RINGKASAN ================"
+          if [ "$FOUND" -eq 1 ]; then
+            {
+              echo "BUILD SUKSES pada kombinasi $N (tanggal=$D, flixel=$FR)"
+              echo "Salin baris ini ke libs.xml untuk mengunci versi:"
+              for k in "${!LOCK[@]}"; do echo "${LOCK[$k]}"; done
+            } >> "$SUMMARY"
+          fi
           cat "$SUMMARY"
           cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$OK" -ne 1 ]; then
-            echo "Semua percobaan gagal."
-            exit 1
-          fi
-      - name: Clear Previous Cache
-        uses: actions/github-script@main
+          [ "$FOUND" -eq 1 ] || exit 1
+      - name: Uploading solver logs
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          script: |
-            try {
-            	const key = "cache-android-pinned-${{ inputs.pin_date }}"
-            	const caches = await github.rest.actions.getActionsCacheList({
-            		owner: context.repo.owner,
-            		repo: context.repo.repo,
-            	})
-            	if (typeof caches.data.actions_caches != null && caches.data.actions_caches.length > 0) {
-            		for (const cache of caches.data.actions_caches) {
-            			if (cache.key == key) {
-            				console.log('Clearing ' + cache.key + '...')
-            				await github.rest.actions.deleteActionsCacheById({
-            					owner: context.repo.owner,
-            					repo: context.repo.repo,
-            					cache_id: cache.id,
-            				})
-            				console.log("Previous Cache Cleared!")
-            			}
-            		}
-            	}
-            } catch (error) {
-            	console.log(error.message);
-            }
-      - name: Save Current Cache
-        id: cache-release-build-android-save
-        uses: actions/cache/save@main
-        with:
-          path: |
-            .haxelib/
-            export/release/android/haxe/
-            export/release/android/obj/
-          key: cache-android-pinned-${{ inputs.pin_date }}
+          name: Solver Logs
+          path: /tmp/solver/*
       - name: Uploading artifact (entire build)
         uses: actions/upload-artifact@v4
         with:
