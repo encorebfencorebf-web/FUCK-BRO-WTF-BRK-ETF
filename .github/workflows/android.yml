@@ -147,6 +147,31 @@ jobs:
             esac
             return 1
           }
+          symfix() { # logfile -> 0 kalau ada library yang dipin ulang
+            local line sym entry cn lib url first
+            line=$(grep -m1 -E "Type not found : |has no field or subtype " "$1")
+            [ -z "$line" ] && return 1
+            sym=$(echo "$line" | sed -E 's/.*(Type not found : |has no field or subtype )([A-Za-z0-9_.]+).*/\2/' | awk -F. '{print $NF}')
+            [ -z "$sym" ] && return 1
+            case " $TRIED " in *" $sym "*) return 1 ;; esac
+            TRIED="$TRIED $sym"
+            for entry in \
+              "animate|flxanimate|$ANIMATE_URL" \
+              "androidtools|extension-androidtools|$ANDROIDTOOLS_URL" \
+              "hscript|hscript-improved|$HSCRIPT_URL" \
+              "ui|flixel-ui|$UI_URL" \
+              "discord|hxdiscord_rpc|$DISCORD_URL" \
+              "away|away3d|$AWAY_URL"; do
+              IFS='|' read -r cn lib url <<< "$entry"
+              if git -C "/tmp/c/$cn" grep -qw -e "$sym" origin/HEAD 2>/dev/null; then
+                first=$(git -C "/tmp/c/$cn" log --reverse -S"$sym" --format=%H origin/HEAD 2>/dev/null | head -n 1)
+                [ -z "$first" ] && continue
+                echo "  SYMFIX: '$sym' ada di $lib, pin ke commit pertama yang memuatnya ($first)"
+                install_git "$lib" "$url" "$first" && return 0
+              fi
+            done
+            return 1
+          }
           run_build() { # label
             timeout 80m haxelib run lime build android -final 2>&1 | tee "$LOGDIR/$1.log"
             return "${PIPESTATUS[0]}"
@@ -158,7 +183,7 @@ jobs:
             grep -qE "androidtools|Compiler\.hx:[0-9]+: characters .*Expected \}" "$1"
           }
           errsum() { # logfile
-            grep -E "Error|characters [0-9]+-[0-9]+|Unsupported|Could not find|Type not found|Loop in class" "$1" | head -n 6
+            grep -E "Error|characters [0-9]+-[0-9]+|Unsupported|Could not find|Type not found|Loop in class" "$1" | grep -v "Warning" | head -n 6
           }
 
           # ---------- siapkan clone ----------
@@ -193,7 +218,6 @@ jobs:
           AT_HEAD=$(git -C /tmp/c/androidtools rev-parse origin/HEAD)
           AT_CANDS+=("$AT_HEAD")
           echo "Kandidat androidtools: ${#AT_CANDS[@]}"
-          for s in "${AT_CANDS[@]}"; do echo "  AT $s"; done
 
           DATES=("$PIN_DATE" 2025-10-15 2025-09-01 2025-07-01 2025-04-01 2025-01-01 2024-09-01 2024-06-01 2024-03-01 2024-01-01)
 
@@ -209,6 +233,7 @@ jobs:
               echo ""
               echo "################ KOMBINASI $N | tanggal=$D | flixel=$FR ################"
               LOCK=()
+              TRIED=""
               pin_static flixel flixel "$FLIXEL_URL" "$FR" "$D"
               pin_static hscript hscript-improved "$HSCRIPT_URL" origin/custom-classes "$D"
               pin_static animate flxanimate "$ANIMATE_URL" origin/HEAD "$D"
@@ -226,11 +251,11 @@ jobs:
 
               ROUND=0
               FIXED=""
-              while [ "$ROUND" -lt 10 ]; do
+              while [ "$ROUND" -lt 12 ]; do
                 ROUND=$((ROUND+1))
                 LABEL="k${N}_r${ROUND}"
                 echo "--- build $LABEL ---"
-                haxelib list | grep -E "flixel|hscript|androidtools|lime|openfl"
+                haxelib list | grep -E "flixel|hscript|androidtools|flxanimate|lime|openfl"
                 run_build "$LABEL"
                 RC=$?
                 if [ "$RC" -eq 0 ]; then
@@ -259,6 +284,10 @@ jobs:
                   echo "  kandidat androidtools habis, lanjut kombinasi berikutnya"
                   break
                 fi
+                # error simbol hilang: cari library yang memuatnya
+                if symfix "$LOGDIR/$LABEL.log"; then
+                  continue
+                fi
                 KEY=$(grep -m1 -E "Unsupported Flixel .* version" "$LOGDIR/$LABEL.log")
                 if [ -n "$KEY" ] && [ "$KEY" = "$FIXED" ]; then
                   echo "Error sama berulang setelah autofix, lanjut kombinasi berikutnya"
@@ -279,6 +308,15 @@ jobs:
               for k in "${!LOCK[@]}"; do echo "${LOCK[$k]}"; done
             } >> "$SUMMARY"
           fi
+          {
+            echo ""
+            echo "===== ERROR TERBANYAK (semua percobaan) ====="
+            cat "$LOGDIR"/k*.log 2>/dev/null \
+              | grep -E "characters [0-9]+-[0-9]+ : |Unsupported|Could not find|Loop in class" \
+              | grep -v "Warning" \
+              | sed -E 's|/home/runner/work/[^/]+/[^/]+/||' \
+              | sort | uniq -c | sort -rn | head -n 15
+          } >> "$SUMMARY"
           cat "$SUMMARY"
           cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
           [ "$FOUND" -eq 1 ] || exit 1
