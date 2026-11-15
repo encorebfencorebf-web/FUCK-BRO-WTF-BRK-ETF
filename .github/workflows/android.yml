@@ -64,6 +64,7 @@ jobs:
           DISCORD_URL="https://github.com/CodenameCrew/cne-hxdiscord_rpc"
           AWAY_URL="https://github.com/CodenameCrew/away3d"
           ANDROIDTOOLS_URL="https://github.com/MAJigsaw77/extension-androidtools"
+          AT_FILE="extension/androidtools/os/Build.hx"
 
           declare -A LOCK
 
@@ -153,6 +154,9 @@ jobs:
           late_stage() { # logfile
             grep -qE "Compiling group|ndk-build|gradlew|> Task :|BUILD FAILED|FAILURE: Build failed" "$1"
           }
+          at_related() { # logfile
+            grep -qE "androidtools|Compiler\.hx:[0-9]+: characters .*Expected \}" "$1"
+          }
           errsum() { # logfile
             grep -E "Error|characters [0-9]+-[0-9]+|Unsupported|Could not find|Type not found|Loop in class" "$1" | head -n 6
           }
@@ -167,14 +171,29 @@ jobs:
           clone away "$AWAY_URL"
           clone androidtools "$ANDROIDTOOLS_URL"
 
+          # branch flixel: bawaan dulu, lalu dev/old/cne saja
           DEFAULT_REF=$(git -C /tmp/c/flixel symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)
           FREFS=()
           [ -n "$DEFAULT_REF" ] && FREFS+=("$DEFAULT_REF")
           for b in $(branches flixel); do
-            [ "origin/$b" = "$DEFAULT_REF" ] && continue
-            FREFS+=("origin/$b")
+            case "$b" in
+              dev|old|cne)
+                [ "origin/$b" = "$DEFAULT_REF" ] && continue
+                FREFS+=("origin/$b")
+                ;;
+            esac
           done
           echo "Branch flixel yang akan dicoba: ${FREFS[*]}"
+
+          # kandidat extension-androidtools: riwayat commit file Build.hx (lama ke baru)
+          AT_CANDS=()
+          for s in $(git -C /tmp/c/androidtools log --reverse --format=%H -- "$AT_FILE" | head -n 8); do
+            AT_CANDS+=("$s")
+          done
+          AT_HEAD=$(git -C /tmp/c/androidtools rev-parse origin/HEAD)
+          AT_CANDS+=("$AT_HEAD")
+          echo "Kandidat androidtools: ${#AT_CANDS[@]}"
+          for s in "${AT_CANDS[@]}"; do echo "  AT $s"; done
 
           DATES=("$PIN_DATE" 2025-10-15 2025-09-01 2025-07-01 2025-04-01 2025-01-01 2024-09-01 2024-06-01 2024-03-01 2024-01-01)
 
@@ -195,7 +214,8 @@ jobs:
               pin_static animate flxanimate "$ANIMATE_URL" origin/HEAD "$D"
               pin_static discord hxdiscord_rpc "$DISCORD_URL" origin/HEAD "$D"
               pin_static away away3d "$AWAY_URL" origin/HEAD "$D"
-              pin_static androidtools extension-androidtools "$ANDROIDTOOLS_URL" origin/HEAD "$D"
+              AT_IDX=0
+              install_git extension-androidtools "$ANDROIDTOOLS_URL" "${AT_CANDS[$AT_IDX]}"
               ASHA=$(best_addons "$D")
               if [ -n "$ASHA" ]; then
                 install_git flixel-addons "$ADDONS_CNE" "$ASHA"
@@ -206,11 +226,11 @@ jobs:
 
               ROUND=0
               FIXED=""
-              while [ "$ROUND" -lt 5 ]; do
+              while [ "$ROUND" -lt 10 ]; do
                 ROUND=$((ROUND+1))
                 LABEL="k${N}_r${ROUND}"
                 echo "--- build $LABEL ---"
-                haxelib list | grep -E "flixel|hscript|lime|openfl"
+                haxelib list | grep -E "flixel|hscript|androidtools|lime|openfl"
                 run_build "$LABEL"
                 RC=$?
                 if [ "$RC" -eq 0 ]; then
@@ -218,7 +238,7 @@ jobs:
                   break 3
                 fi
                 {
-                  echo "KOMBINASI $N ronde $ROUND (tanggal=$D, flixel=$FR): GAGAL"
+                  echo "KOMBINASI $N ronde $ROUND (tanggal=$D, flixel=$FR, androidtools=#$AT_IDX): GAGAL"
                   errsum "$LOGDIR/$LABEL.log"
                   echo ""
                 } >> "$SUMMARY"
@@ -227,6 +247,17 @@ jobs:
                   echo "TAHAP HAXE LOLOS pada kombinasi $N (tanggal=$D, flixel=$FR). Error berikutnya di tahap C++/Gradle." >> "$SUMMARY"
                   STOP=1
                   break 3
+                fi
+                # error terkait extension-androidtools: maju ke kandidat berikutnya
+                if at_related "$LOGDIR/$LABEL.log"; then
+                  AT_IDX=$((AT_IDX+1))
+                  if [ "$AT_IDX" -lt "${#AT_CANDS[@]}" ]; then
+                    echo "  AUTOFIX androidtools -> kandidat #$AT_IDX"
+                    install_git extension-androidtools "$ANDROIDTOOLS_URL" "${AT_CANDS[$AT_IDX]}"
+                    continue
+                  fi
+                  echo "  kandidat androidtools habis, lanjut kombinasi berikutnya"
+                  break
                 fi
                 KEY=$(grep -m1 -E "Unsupported Flixel .* version" "$LOGDIR/$LABEL.log")
                 if [ -n "$KEY" ] && [ "$KEY" = "$FIXED" ]; then
